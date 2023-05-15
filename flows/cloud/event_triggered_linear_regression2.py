@@ -1,4 +1,4 @@
-from metaflow import FlowSpec, step, card, conda_base, current, Parameter, Flow, trigger
+from metaflow import FlowSpec, step, card, conda_base, current, Parameter, Flow, trigger, catch, timeout, retry
 from metaflow.cards import Markdown, Table, Image, Artifact
 
 URL = "https://outerbounds-datasets.s3.us-west-2.amazonaws.com/taxi/latest.parquet"
@@ -6,7 +6,7 @@ DATETIME_FORMAT = '%Y-%m-%d %H:%M:%S'
 
 @trigger(events=['s3'])
 @conda_base(libraries={'pandas': '1.4.2', 'pyarrow': '11.0.0', 'numpy': '1.21.2', 'scikit-learn': '1.1.2'})
-class TaxiFarePrediction1(FlowSpec):
+class TaxiFarePrediction2(FlowSpec):
 
     data_url = Parameter("data_url", default=URL)
 
@@ -21,7 +21,12 @@ class TaxiFarePrediction1(FlowSpec):
             df.trip_distance <= 100,    # trip_distance in miles
             df.trip_distance > 0,
             df.passenger_count >0,
-            df.fare_amount >0
+            df.fare_amount >0,
+            df.mta_tax >=0,
+            df.tip_amount >= 0,
+            df.tolls_amount >=0,
+            df.airport_fee >=0,
+            df.PULocationID!=df.DOLocationID
             # TODO: add some logic to filter out what you decide is bad data!
             # TIP: Don't spend too much time on this step for this project though, it practice it is a never-ending process.
 
@@ -31,6 +36,9 @@ class TaxiFarePrediction1(FlowSpec):
         df= df.dropna()
         return df
 
+    @catch(var="read_failure")
+    @retry(times=4)
+    @timeout(minutes=10)
     @step
     def start(self):
 
@@ -99,4 +107,4 @@ class TaxiFarePrediction1(FlowSpec):
 
 
 if __name__ == "__main__":
-    TaxiFarePrediction1()
+    TaxiFarePrediction2()
