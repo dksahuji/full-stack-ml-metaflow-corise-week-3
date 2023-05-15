@@ -1,4 +1,4 @@
-from metaflow import FlowSpec, step, card, conda_base, current, Parameter, Flow, trigger, catch, timeout, retry
+from metaflow import FlowSpec, step, card, conda_base, current, Parameter, Flow, trigger, catch, timeout, retry, kubernetes
 from metaflow.cards import Markdown, Table, Image, Artifact
 
 URL = "https://outerbounds-datasets.s3.us-west-2.amazonaws.com/taxi/latest.parquet"
@@ -52,15 +52,17 @@ class TaxiFarePrediction2(FlowSpec):
         # In practice, you want split time series data in more sophisticated ways and run backtests. 
         self.X = self.df["trip_distance"].values.reshape(-1, 1)
         self.y = self.df["total_amount"].values
-        self.next(self.linear_model)
+        self.next(self.nn_model)
 
     @step
-    def linear_model(self):
+    def nn_model(self):
         "Fit a single variable, linear model to the data."
         from sklearn.linear_model import LinearRegression
+        from sklearn.neural_network import MLPRegressor
 
         # TODO: Play around with the model if you are feeling it.
-        self.model = LinearRegression()
+        #self.model = LinearRegression()
+        self.model = MLPRegressor(random_state=1, max_iter=500, hidden_layer_sizes=(10, 10, ))
 
         self.next(self.validate)
 
@@ -91,7 +93,8 @@ class TaxiFarePrediction2(FlowSpec):
                 rows.append([Markdown("✅"), Artifact(run.id), Artifact(run.created_at.strftime(DATETIME_FORMAT)), Artifact(str(self.scores.mean())), Markdown("This run...")])
         return rows
                 
-    
+#    @resources(gpu=1)
+    #@kubernetes(memory=4096, cpu=4, gpu=1)
     @card(type="corise")
     @step
     def validate(self):
