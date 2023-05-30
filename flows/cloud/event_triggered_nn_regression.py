@@ -1,0 +1,149 @@
+from metaflow import FlowSpec, step, card, conda_base, current, Parameter, Flow, trigger, catch, timeout, retry, kubernetes, resources
+from metaflow.cards import Markdown, Table, Image, Artifact
+
+URL = "https://outerbounds-datasets.s3.us-west-2.amazonaws.com/taxi/latest.parquet"
+DATETIME_FORMAT = '%Y-%m-%d %H:%M:%S'
+
+@trigger(events=['s3'])
+@conda_base(libraries={'pandas': '1.4.2', 'pyarrow': '11.0.0', 'numpy': '1.21.2', 'scikit-learn': '1.1.2'})
+class TaxiFarePrediction3(FlowSpec):
+
+    data_url = Parameter("data_url", default=URL)
+
+    def transform_features(self, df):
+
+        # TODO: 
+            # Try to complete tasks 2 and 3 with this function doing nothing like it currently is.
+            # Understand what is happening.
+            # Revisit task 1 and think about what might go in this function.
+        obviously_bad_data_filters = [
+            df.fare_amount > 0,         # fare_amount in US Dollars
+            df.trip_distance <= 100,    # trip_distance in miles
+            df.trip_distance > 0,
+            df.passenger_count >0,
+            df.fare_amount >0,
+            df.mta_tax >=0,
+            df.tip_amount >= 0,
+            df.tolls_amount >=0,
+            df.airport_fee >=0,
+            df.PULocationID!=df.DOLocationID
+            # TODO: add some logic to filter out what you decide is bad data!
+            # TIP: Don't spend too much time on this step for this project though, it practice it is a never-ending process.
+
+        ]
+        for f in obviously_bad_data_filters:
+            df = df[f]        
+        df= df.dropna()
+
+        df = df.astype({"payment_type": str, "airport_fee": str, "PULocationID": str, "DOLocationID": str, "hour": str})
+        df["trip_endpoints"] = df["DOLocationID"] + "_" +  df["PULocationID"]
+
+        return df
+
+    @catch(var="read_failure")
+    @retry(times=4)
+    @timeout(minutes=10)
+    @step
+    def start(self):
+
+        import pandas as pd
+        from sklearn.model_selection import train_test_split
+        from sklearn.pipeline import Pipeline, make_pipeline
+        from sklearn.compose import ColumnTransformer
+        from sklearn.preprocessing import OneHotEncoder, MinMaxScaler, StandardScaler
+
+        self.df = self.transform_features(pd.read_parquet(self.data_url))
+
+        self.y = self.df["total_amount"].astype('float64')#.values
+
+        self.df = self.df.filter(items=['trip_distance', 'hour', 'passenger_count', 'payment_type', 'trip_endpoints'])
+        self.feature_numerical_columns = self.df.select_dtypes(include=['int64', 'float64']).columns
+        self.feature_categorical_columns = self.df.select_dtypes(include=["object"]).columns
+        print(len(self.df), self.feature_numerical_columns, self.feature_categorical_columns)
+
+        self.feature_numerical_pipeline = Pipeline([
+                                                ('Normalization_MinMaxScaler', MinMaxScaler())
+                                                ])
+        self.feature_categorical_pipeline = Pipeline([
+                                                ('OneHotEncoder', OneHotEncoder(sparse=True, handle_unknown='ignore'))
+                                                ])
+        self.preprocessor = ColumnTransformer([
+                                ('numerical_pipeline', self.feature_numerical_pipeline, self.feature_numerical_columns),
+                                ('categorical_pipeline', self.feature_categorical_pipeline, self.feature_categorical_columns)
+                                ])
+
+        # NOTE: we are split into training and validation set in the validation step which uses cross_val_score.
+        # This is a simple/naive way to do this, and is meant to keep this example simple, to focus learning on deploying Metaflow flows.
+        # In practice, you want split time series data in more sophisticated ways and run backtests. 
+        #self.X = self.df["trip_distance"].values.reshape(-1, 1)
+        self.X = self.df
+        #self.X_preprocessor = self.preprocessor.fit_transform(self.X)
+        #print(type(self.X_preprocessor)) # <class 'scipy.sparse._csr.csr_matrix'>
+        #print(self.X_preprocessor.todense())
+        #print(self.X_preprocessor)
+        
+        self.next(self.nn_model)
+
+    @step
+    def nn_model(self):
+        "Fit a single variable, linear model to the data."
+        from sklearn.linear_model import LinearRegression
+        from sklearn.neural_network import MLPRegressor
+        from sklearn.pipeline import Pipeline
+
+        # TODO: Play around with the model if you are feeling it.
+        #self.model = LinearRegression()
+        self.model = MLPRegressor(random_state=42, max_iter=20, hidden_layer_sizes=(5, 5, ), batch_size=64)
+        self.model_pipeline = Pipeline([
+                                ('preprocessor', self.preprocessor),
+                                ('model', self.model) 
+                                ])
+        self.next(self.validate)
+
+    def gather_sibling_flow_run_results(self):
+
+        # storage to populate and feed to a Table in a Metaflow card
+        rows = []
+
+        # loop through runs of this flow 
+        for run in Flow(self.__class__.__name__):
+            print(run, run.successful, run.id, current.run_id)
+            if run.id != current.run_id:
+                if run.successful:
+                    icon = "✅" 
+                    msg = "OK"
+                    print(run.data.scores)
+                    score = str(run.data.scores.mean())
+                else:
+                    icon = "❌"
+                    msg = "Error"
+                    score = "NA"
+                    for step in run:
+                        for task in step:
+                            if not task.successful:
+                                msg = task.stderr
+                row = [Markdown(icon), Artifact(run.id), Artifact(run.created_at.strftime(DATETIME_FORMAT)), Artifact(score), Markdown(msg)]
+                rows.append(row)
+            else:
+                rows.append([Markdown("✅"), Artifact(run.id), Artifact(run.created_at.strftime(DATETIME_FORMAT)), Artifact(str(self.scores.mean())), Markdown("This run...")])
+        return rows
+                
+    @resources(memory=15000)
+    @kubernetes(memory=15000)
+    @card(type="corise")
+    @step
+    def validate(self):
+        from sklearn.model_selection import cross_val_score
+        print("validate")
+        self.scores = cross_val_score(self.model_pipeline, self.X, self.y, cv=3, scoring="r2")
+        print("R2: ", self.scores.mean())
+        current.card.append(Markdown("# Taxi Fare Prediction Results"))
+        current.card.append(Table(self.gather_sibling_flow_run_results(), headers=["Pass/fail", "Run ID", "Created At", "R^2 score", "Stderr"]))
+        self.next(self.end)
+
+    @step
+    def end(self):
+        print("Success!")
+
+if __name__ == "__main__":
+    TaxiFarePrediction3()
